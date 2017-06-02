@@ -16,6 +16,20 @@
 
 #include "learn.h"
 
+// 普通のシグモイド関数
+double sigmoid(double x)
+{
+	return 1.0 / (1.0 + std::exp(-x));
+}
+
+// 評価値を勝率[0,1]に変換する関数
+double winning_percentage(double value)
+{
+	// この600.0という定数は、ponanza定数。(ponanzaがそうしているらしいという意味で)
+	// ゲームの進行度に合わせたものにしたほうがいいかも知れないけども、その効果のほどは不明。
+	return sigmoid(value / 600.0);
+}
+
 // ----------------------
 // 学習時に関する、あまり大した意味のない設定項目はここ。
 // ----------------------
@@ -280,6 +294,12 @@ struct MultiThinkGenSfen : public MultiThink
 	// sfenの書き出し器
 	SfenWriter& sw;
 
+	vector<vector<vector<s64>>> sum;
+	vector<vector<vector<s64>>> ssum;
+	vector<vector<vector<double>>> psum;
+	vector<vector<vector<double>>> pssum;
+	vector<u64> count;
+
 	// 同一局面の書き出しを制限するためのhash
 	// hash_indexを求めるためのmaskに使うので、2**Nでなければならない。
 	static const u64 GENSFEN_HASH_SIZE = 64 * 1024 * 1024;
@@ -297,6 +317,11 @@ void MultiThinkGenSfen::thread_worker(size_t thread_id)
 
 	// 定跡の指し手を用いるモード
 	int book_ply = Options["BookMoves"];
+	auto &s(sum[thread_id]);
+	auto &ss(ssum[thread_id]);
+	auto &ps(psum[thread_id]);
+	auto &pss(pssum[thread_id]);
+	auto &c(count[thread_id]);
 
 	// 規定回数回になるまで繰り返し
 	while (true)
@@ -397,11 +422,28 @@ void MultiThinkGenSfen::thread_worker(size_t thread_id)
 				// 探索窓を狭めておいても問題ないはず。
 
 				int depth = search_depth + (int)rand(search_depth2 - search_depth + 1);
+				std::vector<Value> value;
+				value.push_back(Eval::evaluate(pos));
+				for (int d = 0; d < depth; ++d) {
+					auto pvv = Learner::search(pos, d);
+					value.push_back(pvv.first);
+				}
 
 				auto pv_value1 = Learner::search(pos, depth);
 
 				auto value1 = pv_value1.first;
 				auto pv1 = pv_value1.second;
+				value.push_back(value1);
+				for (unsigned int i = 0; i < value.size(); ++i) {
+					for (unsigned int j = 0; j < i; ++j) {
+						s[i][j] += value[j] - value[i];
+						ss[i][j] += (int)(value[j] - value[i]) * (int)(value[j] - value[i]);
+						auto wp(winning_percentage(value[j]) - winning_percentage(value[i]));
+						ps[i][j] += wp;
+						pss[i][j] += wp * wp;
+					}
+				}
+				++c;
 
 				// 評価値の絶対値がこの値以上の局面については
 				// その局面を学習に使うのはあまり意味がないのでこの試合を終了する。
@@ -674,18 +716,75 @@ void gen_sfen(Position&, istringstream& is)
 		<< " , filename = " << filename
 		<< endl;
 
+
+	const int numThread(Options["Threads"]);
 	// Options["Threads"]の数だけスレッドを作って実行。
 	{
-		SfenWriter sw(filename, thread_num);
-		MultiThinkGenSfen multi_think(search_depth, search_depth2, sw);
+		shared_ptr<SfenWriter> sw(new SfenWriter(filename, thread_num));
+		MultiThinkGenSfen multi_think(search_depth, search_depth2, *sw.get());
 		multi_think.set_loop_max(loop_max);
 		multi_think.eval_limit = eval_limit;
 		multi_think.start_file_write_worker();
+		multi_think.sum.resize(numThread, vector<vector<s64>>(search_depth2+2, vector<s64>(search_depth2+2)));
+		multi_think.ssum.resize(numThread, vector<vector<s64>>(search_depth2+2, vector<s64>(search_depth2+2)));
+		multi_think.psum.resize(numThread, vector<vector<double>>(search_depth2+2, vector<double>(search_depth2+2)));
+		multi_think.pssum.resize(numThread, vector<vector<double>>(search_depth2+2, vector<double>(search_depth2+2)));
+		multi_think.count.resize(numThread);
 		multi_think.go_think();
 
+		sw.reset();
 		// SfenWriterのデストラクタでjoinするので、joinが終わってから終了したというメッセージを
 		// 表示させるべきなのでここをブロックで囲む。
+		u64 count(multi_think.count[0]);
+		for (int i = 1; i < numThread; ++i) {
+			count += multi_think.count[i];
+			for (int j = 0; j < search_depth2+2; ++j) {
+				for (int k = 0; k < j; ++k) {
+					multi_think.sum[0][j][k] += multi_think.sum[i][j][k];
+					multi_think.ssum[0][j][k] += multi_think.ssum[i][j][k];
+					multi_think.psum[0][j][k] += multi_think.psum[i][j][k];
+					multi_think.pssum[0][j][k] += multi_think.pssum[i][j][k];
+				}
+			}
+		}
+		cerr << "average of evaluation diff¥n";
+		for (int j = 0; j < search_depth2+2; ++j) {
+			if (j == 0) cerr << "evaluate: ";
+			if (j > 0) cerr << "search " << j-1 << ": ";
+			for (int k = 0; k < j; ++k) {
+				cerr << (double)multi_think.sum[0][j][k] / count << ", ";
+			}
+			cerr << endl;
+		}
+		cerr << "variance of evaluation diff¥n";
+		for (int j = 0; j < search_depth2+2; ++j) {
+			if (j == 0) cerr << "evaluate: ";
+			if (j > 0) cerr << "search " << j-1 << ": ";
+			for (int k = 0; k < j; ++k) {
+				cerr << sqrt((double)multi_think.ssum[0][j][k] / count) << ", ";
+			}
+			cerr << endl;
+		}
+		cerr << "average of winning percentage diff¥n";
+		for (int j = 0; j < search_depth2+2; ++j) {
+			if (j == 0) cerr << "evaluate: ";
+			if (j > 0) cerr << "search " << j-1 << ": ";
+			for (int k = 0; k < j; ++k) {
+				cerr << (double)multi_think.psum[0][j][k] / count << ", ";
+			}
+			cerr << endl;
+		}
+		cerr << "variance of winning percentage diff¥n";
+		for (int j = 0; j < search_depth2+2; ++j) {
+			if (j == 0) cerr << "evaluate: ";
+			if (j > 0) cerr << "search " << j-1 << ": ";
+			for (int k = 0; k < j; ++k) {
+				cerr << sqrt((double)multi_think.pssum[0][j][k] / count) << ", ";
+			}
+			cerr << endl;
+		}
 	}
+
 
 	std::cout << "gen_sfen finished." << endl;
 }
@@ -694,19 +793,6 @@ void gen_sfen(Position&, istringstream& is)
 // 生成した棋譜から学習させるコマンド(learn)
 // -----------------------------------
 
-// 普通のシグモイド関数
-double sigmoid(double x)
-{
-	return 1.0 / (1.0 + std::exp(-x));
-}
-
-// 評価値を勝率[0,1]に変換する関数
-double winning_percentage(double value)
-{
-	// この600.0という定数は、ponanza定数。(ponanzaがそうしているらしいという意味で)
-	// ゲームの進行度に合わせたものにしたほうがいいかも知れないけども、その効果のほどは不明。
-	return sigmoid(value / 600.0);
-}
 
 // 普通のシグモイド関数の導関数。
 double dsigmoid(double x)
